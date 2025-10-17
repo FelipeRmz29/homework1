@@ -8,76 +8,82 @@
 #include <sys/wait.h>
 #include <signal.h>
 #include <errno.h>
-#include <sys/time.h> // Para el tiempo de ejecución
+#include <time.h> // time() y difftime()
+#include <dirent.h> // Para el árbol de procesos
+#include <ctype.h> // Para la validación del PID
 
 // Variables globales (Parte 2.1)
 process_info_t process_table[MAX_PROCESSES];
 int process_count = 0;
+// Flag para manejo seguro de SIGCHLD. Inicialmente 0 (no hay niños terminados)
+volatile sig_atomic_t children_terminated = 0; 
+
+// -----------------------------------------------------------------------------
+// Parte 1: Basic Process Creation & Termination
+// -----------------------------------------------------------------------------
+
 // Parte 1.1: Process Creation
 int create_process(const char *command, char *args[]) {
-    pid_t pid = fork();
+    pid_t pid;
+
+    // Bloquear SIGCHLD para evitar una carrera si el niño termina muy rápido
+    sigset_t mask, oldmask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGCHLD);
+    sigprocmask(SIG_BLOCK, &mask, &oldmask);
+
+    pid = fork();
 
     if (pid < 0) {
         // Error de fork
         perror("fork");
+        sigprocmask(SIG_SETMASK, &oldmask, NULL); // Restaurar máscara
         return -1;
     } else if (pid == 0) {
         // Código del proceso hijo
-        // execvp requiere que el primer argumento (args[0]) sea el nombre del comando
-        // y el último sea NULL.
+        sigprocmask(SIG_SETMASK, &oldmask, NULL); // El hijo debe restaurar la máscara
         
         // Ejecutar el comando
         execvp(command, args);
         
         // Si execvp retorna, significa que falló.
-        // EVITAR imprimir desde el hijo si el padre ya está usando la consola
         perror("execvp");
-        // El hijo debe salir inmediatamente con error para evitar ejecutar código de padre
-        exit(EXIT_FAILURE); 
+        exit(EXIT_FAILURE); // El hijo debe salir inmediatamente con error
     } else {
         // Código del proceso padre
-        // Almacenar el PID en la tabla de procesos (implementado en Paso 4)
+        // Almacenar el PID en la tabla de procesos
         if (add_process_to_table(pid, command, args) == -1) {
             fprintf(stderr, "Advertencia: Tabla de procesos llena. Proceso creado pero no gestionado.\n");
         }
+        
+        sigprocmask(SIG_SETMASK, &oldmask, NULL); // Restaurar máscara
         return pid;
     }
 }
+
 // Parte 1.2: Process Status Monitoring
+// Función simplificada para solo verificar si terminó (reap se hace con SIGCHLD)
 int check_process_status(pid_t pid) {
     int status;
     // WNOHANG: retorna inmediatamente si el hijo no ha terminado.
     pid_t result = waitpid(pid, &status, WNOHANG); 
 
     if (result == 0) {
-        // El proceso sigue corriendo (aún no ha cambiado de estado)
-        return 1; 
+        return 1; // Sigue corriendo
     } else if (result > 0) {
-        // El proceso terminó (ha cambiado de estado)
-        if (WIFEXITED(status)) {
-            // El proceso terminó normalmente
-            update_process_status(pid, 1, WEXITSTATUS(status));
-            return 0;
-        } else if (WIFSIGNALED(status)) {
-            // El proceso fue terminado por una señal
-            update_process_status(pid, 1, WTERMSIG(status));
-            return 0;
-        }
-        // También considera otros estados (WIFSTOPPED, etc.) si es necesario.
-        return 0; 
+        // El proceso terminó y fue cosechado por esta llamada (o por el shell)
+        // No es necesario llamar a update_process_status aquí, ya que el reap
+        // se maneja por SIGCHLD/reap_terminated_children.
+        return 0; // Terminado
     } else if (result == -1 && errno == ECHILD) {
         // No hay proceso hijo con ese PID (ya fue re-cosechado o el PID es incorrecto)
-        // Marcar como terminado en la tabla si existe.
-        int index = find_process_by_pid(pid);
-        if (index != -1 && process_table[index].status == 0) {
-             update_process_status(pid, 1, 0); // Asumimos terminación
-        }
-        return -1; // Error o ya no existe
+        return -1;
     } else {
-        perror("waitpid");
+        perror("waitpid in check_status");
         return -1; // Error
     }
 }
+
 // Parte 1.3: Process Termination
 int terminate_process(pid_t pid, int force) {
     int sig = force ? SIGKILL : SIGTERM;
@@ -90,7 +96,7 @@ int terminate_process(pid_t pid, int force) {
 
     if (kill(pid, sig) == -1) {
         if (errno == ESRCH) {
-            fprintf(stderr, "Advertencia: Proceso %d no existe, actualizando tabla.\n", pid);
+            fprintf(stderr, "Advertencia: Proceso %d no existe, limpiando tabla.\n", pid);
             remove_process_from_table(index); // Limpiar si no existe
             return 0;
         }
@@ -102,7 +108,7 @@ int terminate_process(pid_t pid, int force) {
     int status;
     pid_t result;
     do {
-        // No usar WNOHANG aquí, queremos esperar su terminación (reap)
+        // Espera bloqueante para garantizar el reap inmediatamente después de kill.
         result = waitpid(pid, &status, 0); 
     } while (result == -1 && errno == EINTR);
 
@@ -113,10 +119,17 @@ int terminate_process(pid_t pid, int force) {
         return 0;
     } else if (result == -1) {
         perror("waitpid cleanup");
+        // Si falló el waitpid (ej: ECHILD), asumimos que el handler lo cosechó.
+        remove_process_from_table(index); 
         return -1;
     }
     return 0;
 }
+
+// -----------------------------------------------------------------------------
+// Parte 2: Process Manager Auxiliaries
+// -----------------------------------------------------------------------------
+
 // Auxiliar: Encuentra el índice de un PID en la tabla
 int find_process_by_pid(pid_t pid) {
     for (int i = 0; i < MAX_PROCESSES; i++) {
@@ -129,16 +142,20 @@ int find_process_by_pid(pid_t pid) {
 
 // Auxiliar: Agrega un proceso a la tabla
 int add_process_to_table(pid_t pid, const char *command, char *args[]) {
+    if (process_count >= MAX_PROCESSES) return -1;
+
     // Buscar un espacio libre (pid == 0)
     for (int i = 0; i < MAX_PROCESSES; i++) {
         if (process_table[i].pid == 0) {
             process_table[i].pid = pid;
-            // Concatenar comando y argumentos para un solo string
+            
+            // Construir el string de comando y argumentos
             snprintf(process_table[i].command, COMMAND_LEN, "%s", command);
             for(int j = 1; args[j] != NULL && j < MAX_ARGS; j++) {
                 strncat(process_table[i].command, " ", COMMAND_LEN - strlen(process_table[i].command) - 1);
                 strncat(process_table[i].command, args[j], COMMAND_LEN - strlen(process_table[i].command) - 1);
             }
+            
             process_table[i].start_time = time(NULL);
             process_table[i].status = 0; // 0=running
             process_table[i].exit_status = -1;
@@ -149,7 +166,7 @@ int add_process_to_table(pid_t pid, const char *command, char *args[]) {
     return -1; // Tabla llena
 }
 
-// Auxiliar: Actualiza el estado de un proceso (usado por check_process_status y sigchld_handler)
+// Auxiliar: Actualiza el estado de un proceso
 void update_process_status(pid_t pid, int status, int exit_status) {
     int index = find_process_by_pid(pid);
     if (index != -1) {
@@ -160,14 +177,56 @@ void update_process_status(pid_t pid, int status, int exit_status) {
 
 // Auxiliar: Remueve un proceso de la tabla (marcando su espacio como libre)
 void remove_process_from_table(int index) {
-    if (index >= 0 && index < MAX_PROCESSES) {
+    if (index >= 0 && index < MAX_PROCESSES && process_table[index].pid != 0) {
         // Marcar como vacío (PID 0)
         memset(&process_table[index], 0, sizeof(process_info_t)); 
         process_count--;
     }
 }
+
+// Nueva función segura: Cosecha y limpia la tabla si el flag está activo (Parte 3.2 robusta)
+void reap_terminated_children(void) {
+    if (!children_terminated) return;
+    
+    // Bloquear SIGCHLD para asegurar que el handler no intente actualizar la tabla al mismo tiempo
+    sigset_t mask, oldmask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGCHLD);
+    sigprocmask(SIG_BLOCK, &mask, &oldmask);
+
+    int status;
+    pid_t pid;
+    
+    // Recorrer la tabla para ver qué procesos han terminado (status == 1)
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (process_table[i].pid != 0 && process_table[i].status == 1) {
+            // Se asume que el proceso ya fue cosechado por el handler, solo removemos.
+            remove_process_from_table(i);
+        } else if (process_table[i].pid != 0 && process_table[i].status == 0) {
+            // Volver a chequear si terminó sin que el handler lo haya actualizado
+            pid = process_table[i].pid;
+            if (waitpid(pid, &status, WNOHANG) > 0) {
+                 update_process_status(pid, 1, WIFEXITED(status) ? WEXITSTATUS(status) : WTERMSIG(status));
+                 remove_process_from_table(i);
+            }
+        }
+    }
+
+    // El flag es reseteado DESPUÉS de la cosecha segura en la zona crítica
+    children_terminated = 0;
+    
+    sigprocmask(SIG_SETMASK, &oldmask, NULL);
+}
+
+// -----------------------------------------------------------------------------
+// Parte 2: Process Manager
+// -----------------------------------------------------------------------------
+
 // Parte 2.2: Process List
 void list_processes(void) {
+    // Reap antes de listar para ver el estado más actualizado
+    reap_terminated_children(); 
+    
     printf("PID\tCOMMAND\t\t\tRUNTIME\t\tSTATUS\n");
     printf("-----\t--------------------------\t----------------\t----------------\n");
     time_t current_time = time(NULL);
@@ -179,15 +238,7 @@ void list_processes(void) {
             int status = process_table[i].status;
 
             // Calcular tiempo de ejecución
-            double elapsed = 0;
-            if (status == 0) { // Sólo si está corriendo
-                elapsed = difftime(current_time, process_table[i].start_time);
-            } else {
-                // Si terminó, el tiempo de inicio puede usarse para la duración total.
-                // (Para simplificar, usaremos el tiempo hasta la llamada a esta función
-                // para los procesos que están en estado 'Terminated' pero no han sido removidos).
-                elapsed = difftime(current_time, process_table[i].start_time); 
-            }
+            double elapsed = difftime(current_time, process_table[i].start_time);
             
             // Formatear tiempo (HH:MM:SS)
             int hours = (int)elapsed / 3600;
@@ -201,10 +252,6 @@ void list_processes(void) {
             char term_info[32] = "";
             if (status == 0) {
                 status_str = "Running";
-                // Llama a check_process_status para verificar si terminaron en segundo plano
-                // (esto puede ser caro, una mejor práctica es confiar en SIGCHLD, 
-                // pero lo ponemos para actualizar si no se ha reapeado inmediatamente).
-                // check_process_status(pid); 
             } else if (status == 1) {
                 status_str = "Terminated";
                 snprintf(term_info, 32, " (Exit: %d)", process_table[i].exit_status);
@@ -220,6 +267,7 @@ void list_processes(void) {
         printf("(No hay procesos gestionados actualmente)\n");
     }
 }
+
 // Parte 2.3: Process Wait
 void wait_all_processes(void) {
     // Bloquear SIGCHLD para evitar interferencias
@@ -230,8 +278,11 @@ void wait_all_processes(void) {
 
     printf("Esperando la finalización de todos los procesos gestionados...\n");
     int processes_waited = 0;
+    int max_i = MAX_PROCESSES; // Usar una variable local porque el índice puede cambiar
 
-    for (int i = 0; i < MAX_PROCESSES; i++) {
+    // Usar un bucle while para re-chequear la tabla después de cada wait/remove
+    int i = 0;
+    while (i < MAX_PROCESSES) {
         if (process_table[i].pid != 0 && process_table[i].status == 0) {
             pid_t pid = process_table[i].pid;
             int status;
@@ -242,22 +293,27 @@ void wait_all_processes(void) {
             do {
                 // Espera bloqueante
                 result = waitpid(pid, &status, 0); 
-            } while (result == -1 && errno == EINTR); // Reintentar si la llamada es interrumpida por una señal
+            } while (result == -1 && errno == EINTR);
 
             if (result > 0) {
                 // Proceso cosechado. Actualizar y remover.
                 update_process_status(pid, 1, WIFEXITED(status) ? WEXITSTATUS(status) : WTERMSIG(status));
                 remove_process_from_table(i); 
                 processes_waited++;
+                // No incrementamos i, porque remove_process_from_table llenó este índice con el siguiente
+                // (aunque aquí estamos memset, no reubicando, el incremento es seguro, pero hay que tener cuidado)
+                i++;
             } else if (result == -1) {
-                // El proceso ya no existe (probablemente re-cosechado por el handler)
                 if (errno == ECHILD) {
                     fprintf(stderr, "Advertencia: Proceso %d ya había terminado/sido limpiado.\n", pid);
                     remove_process_from_table(i); 
                 } else {
                     perror("waitpid in wait_all_processes");
                 }
+                i++;
             }
+        } else {
+            i++;
         }
     }
 
@@ -266,117 +322,97 @@ void wait_all_processes(void) {
     // Restaurar la máscara de señales
     sigprocmask(SIG_SETMASK, &oldmask, NULL);
 }
+
+// -----------------------------------------------------------------------------
 // Parte 3: Signal Handling
+// -----------------------------------------------------------------------------
+
 void setup_signal_handlers(void) {
     struct sigaction sa_int, sa_chld;
 
     // 3.1 SIGINT Handler (Ctrl+C)
     sa_int.sa_handler = sigint_handler;
     sigemptyset(&sa_int.sa_mask);
-    sa_int.sa_flags = 0; // Por defecto
+    sa_int.sa_flags = 0;
     if (sigaction(SIGINT, &sa_int, NULL) == -1) {
         perror("sigaction SIGINT");
         exit(EXIT_FAILURE);
     }
 
-    // 3.2 SIGCHLD Handler (Reap child)
+    // 3.2 SIGCHLD Handler (Anti-Zombie)
     sa_chld.sa_handler = sigchld_handler;
-    // SA_RESTART: para reiniciar syscalls interrumpidas.
-    // SA_RESTART es seguro, pero se necesita un bucle de espera en el handler.
-    sa_chld.sa_flags = SA_RESTART; 
-    sigemptyset(&sa_chld.sa_mask); 
+    sigemptyset(&sa_chld.sa_mask);
+    sa_chld.sa_flags = SA_RESTART | SA_NOCLDSTOP; // SA_NOCLDSTOP evita señales por stop
     if (sigaction(SIGCHLD, &sa_chld, NULL) == -1) {
         perror("sigaction SIGCHLD");
         exit(EXIT_FAILURE);
     }
 }
+
 // Parte 3.2: SIGCHLD Handler (Anti-Zombie)
 void sigchld_handler(int signum) {
     int status;
     pid_t pid;
 
-    // Usar waitpid en un bucle con WNOHANG para re-cosechar *todos* // los hijos terminados (previene zombis).
+    // Usar waitpid en un bucle con WNOHANG para re-cosechar *todos* los hijos terminados
     while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
-        // En un handler de señal, es inseguro llamar a funciones como printf/fprintf
-        // y a la mayoría de las funciones de la librería estándar (incluyendo las de la tabla).
-        // Por ahora, solo re-cosecharemos el proceso.
+        // En un signal handler, NO es seguro llamar a find_process_by_pid o update_process_status.
+        // Solo cosechamos el proceso (lo cual es el requerimiento principal para anti-zombie).
         
-        // La actualización de la tabla se debe posponer a un lugar seguro o 
-        // usar funciones atómicas. Por la simplicidad de este ejercicio:
-        
-        // Bloquear SIGCHLD (ya está bloqueado por defecto al entrar al handler, 
-        // pero es una buena práctica bloquear otras señales si se modifica el estado).
-        // Nota: Es mejor actualizar un flag y hacer la limpieza en el loop principal. 
-        // Para cumplir con el requerimiento de "Actualizar la tabla", se hace aquí, 
-        // pero con la advertencia de que es una zona crítica.
-        
-        int index = find_process_by_pid(pid);
-        if (index != -1) {
-            update_process_status(pid, 1, WIFEXITED(status) ? WEXITSTATUS(status) : WTERMSIG(status));
-            // No remover aquí, solo actualizar estado.
-            // La remoción se hace en wait_all_processes o en el shell.
-        } else {
-            // El proceso no era uno de los gestionados, pero fue re-cosechado.
-        }
+        // Ahora, actualizamos el flag atómico para que el loop principal (shell) haga la limpieza.
+        children_terminated = 1;
+
+        // Si WIFEXITED/WIFSIGNALED, podemos obtener el estado para una futura actualización segura.
+        // Pero por seguridad de señal, solo lo marcamos.
+        // El loop principal re-chequeará el estado de la tabla si el flag está activo.
     }
 
-    if (pid == -1 && errno != ECHILD) {
-        // En un handler, solo se pueden usar write() para mensajes de error.
-        // write(STDERR_FILENO, "Error en waitpid en sigchld_handler\n", 35);
-    }
+    // No se necesita verificar el error de waitpid, ya que ECHILD es normal cuando no hay más.
 }
+
 // Parte 3.1: SIGINT Handler
 void sigint_handler(int signum) {
     // Usar write() por ser async-signal-safe
     const char msg[] = "\nShutting down gracefully...\n";
     write(STDOUT_FILENO, msg, sizeof(msg) - 1);
 
-    // Iterar y enviar SIGTERM a todos los procesos en ejecución
+    // Enviar SIGTERM a todos los procesos en ejecución (asumiendo que pid != 0 es un hijo)
+    // NOTA: Esta iteración en la tabla NO es completamente async-signal-safe, pero es la práctica
+    // requerida para estos ejercicios de "limpieza en el handler".
     for (int i = 0; i < MAX_PROCESSES; i++) {
         if (process_table[i].pid != 0 && process_table[i].status == 0) {
-            // Enviar SIGTERM
             kill(process_table[i].pid, SIGTERM); 
         }
     }
     
-    // Esperar a que todos terminen (reutilizamos la lógica, pero en un contexto de salida)
-    // Nota: Llamar a wait_all_processes() no es 100% async-signal-safe, 
-    // pero para este tipo de asignación que requiere limpieza en el handler, es común hacerlo.
-    
-    // Mejor: configurar un flag global para que el loop principal salga.
-    // Como el requisito pide esperar aquí:
-    
-    // Esto es BLOQUEANTE y por fuera de la tabla para no depender de sus funciones inseguras.
+    // Esperar a que todos terminen (bloqueante)
     int status;
-    pid_t pid;
-    while ((pid = waitpid(-1, &status, 0)) > 0) {
-        // Cosechar todos.
-        // Se puede hacer la actualización y remoción aquí con cuidado.
-        int index = find_process_by_pid(pid);
-        if (index != -1) {
-            update_process_status(pid, 1, WIFEXITED(status) ? WEXITSTATUS(status) : WTERMSIG(status));
-            // No remover para que el shell pueda ver el estado final.
-        }
+    while (waitpid(-1, &status, 0) > 0) {
+        // Cosechar todos. La tabla será re-inicializada o ignorada al salir.
     }
     
     // Salir del programa limpiamente.
     exit(EXIT_SUCCESS); 
 }
+
+// -----------------------------------------------------------------------------
+// Parte 4: Process Tree Visualization (Refactorizado)
+// -----------------------------------------------------------------------------
+
 // Auxiliar: Obtiene el PPID y el nombre del comando del PID dado.
 // Retorna el PPID.
-pid_t get_ppid(pid_t pid, char *comm_buffer, size_t buffer_len) {
+pid_t get_ppid_comm(pid_t pid, char *comm_buffer, size_t buffer_len) {
     char path[256];
     sprintf(path, "/proc/%d/stat", pid);
     FILE *fp = fopen(path, "r");
     if (!fp) {
-        // El proceso puede haber terminado.
         snprintf(comm_buffer, buffer_len, "<Terminated/N/A>");
         return 0; 
     }
 
     int proc_pid, ppid;
     char state, comm_temp[256];
-    // Se necesita leer 4 campos: PID, TCOMM, STATE, PPID
+    // Se lee: PID, TCOMM, STATE, PPID
     if (fscanf(fp, "%d %s %c %d", &proc_pid, comm_temp, &state, &ppid) != 4) {
         fclose(fp);
         snprintf(comm_buffer, buffer_len, "<Read Error>");
@@ -385,8 +421,7 @@ pid_t get_ppid(pid_t pid, char *comm_buffer, size_t buffer_len) {
 
     fclose(fp);
     
-    // El nombre del comando en /proc/stat está entre paréntesis, por ejemplo, (bash)
-    // Quitarlos.
+    // Quitar paréntesis del nombre del comando (ej: (bash) -> bash)
     size_t len = strlen(comm_temp);
     if (len > 0 && comm_temp[0] == '(' && comm_temp[len - 1] == ')') {
         comm_temp[len - 1] = '\0';
@@ -397,75 +432,95 @@ pid_t get_ppid(pid_t pid, char *comm_buffer, size_t buffer_len) {
     
     return ppid;
 }
-// Parte 4: Process Tree Visualization
-// Implementación auxiliar para recursión
-void print_process_tree_recursive(pid_t root_pid, int depth) {
-    // 1. Obtener la info del PID raíz (y su nombre)
-    char comm_buffer[256];
-    // Llamada no necesaria ya que el root_pid es el PPID para los hijos.
 
-    // Formatear la indentación
-    for (int i = 0; i < depth; i++) {
-        // En una implementación completa, se debe rastrear si es el último hijo.
-        // Para simplificar, solo imprimimos espacios.
-        printf("  "); 
-    }
+// Parte 4: Process Tree Visualization (Recursiva)
+void print_process_tree_recursive(pid_t parent_pid, int depth, const int *child_pids, int num_children) {
+    char comm_buffer[COMMAND_LEN];
+    proc_entry_t *children_list = NULL;
+    int children_count = 0;
+    int max_children = 16; // Asumimos un máximo temporal
 
-    // 2. Imprimir la línea del proceso actual (si no es la primera llamada)
-    if (depth > 0) {
-        // Nota: Solo se imprime el PID y el nombre del comando. 
-        // La lógica de [1000] procman, ├─, └─ es más compleja.
-        
-        // Para una representación sencilla:
-        pid_t ppid = get_ppid(root_pid, comm_buffer, sizeof(comm_buffer));
-        printf("[%-5d] %s (PPID: %d)\n", root_pid, comm_buffer, ppid);
-    }
+    // 1. Recolectar todos los hijos de 'parent_pid'
+    children_list = malloc(max_children * sizeof(proc_entry_t));
+    if (!children_list) return; // Manejo básico de error
 
-    // 3. Iterar sobre /proc para encontrar hijos.
     DIR *dir;
     struct dirent *ent;
     if ((dir = opendir("/proc")) == NULL) {
-        perror("opendir /proc");
+        free(children_list);
         return;
     }
 
-    // Recorrer las entradas de /proc
+    // Primer pasada: recolectar hijos
     while ((ent = readdir(dir)) != NULL) {
-        // Verificar si la entrada es un directorio con nombre numérico (un PID)
         if (ent->d_type == DT_DIR) {
             pid_t current_pid = atoi(ent->d_name);
             if (current_pid > 0) {
-                char temp_comm[256];
-                pid_t ppid = get_ppid(current_pid, temp_comm, sizeof(temp_comm));
+                char temp_comm[COMMAND_LEN];
+                pid_t ppid = get_ppid_comm(current_pid, temp_comm, sizeof(temp_comm));
 
-                // Si su PPID es el PID raíz, es un hijo.
-                if (ppid == root_pid) {
-                    // Llamada recursiva para el hijo
-                    // NOTA: Para implementar ├─ y └─, necesitas saber si es el *último* hijo.
-                    // Esto requiere almacenar todos los PIDs hijos antes de la recursión.
-                    // Simplificando la impresión:
-                    printf("  "); // Indentación
-                    for (int i = 0; i < depth; i++) printf("  "); // Indentación
-                    printf("└─ ");
-                    print_process_tree_recursive(current_pid, depth + 1);
+                // Si su PPID es el PID raíz
+                if (ppid == parent_pid) {
+                    if (children_count >= max_children) {
+                        // Reasignar más memoria si es necesario (manejo simple de overflow)
+                        max_children *= 2;
+                        children_list = realloc(children_list, max_children * sizeof(proc_entry_t));
+                        if (!children_list) {
+                            // Limpieza y salida si falla realloc
+                            closedir(dir);
+                            return;
+                        }
+                    }
+                    children_list[children_count].pid = current_pid;
+                    children_list[children_count].ppid = ppid;
+                    strncpy(children_list[children_count].comm, temp_comm, COMMAND_LEN);
+                    children_count++;
                 }
             }
         }
     }
     closedir(dir);
+
+    // 2. Imprimir y recursar para cada hijo
+    for (int i = 0; i < children_count; i++) {
+        // Imprimir la indentación de los niveles superiores
+        for (int j = 0; j < depth; j++) {
+            // Asumir que si el padre no fue el último, se imprime el pipe (│)
+            // Lógica compleja simplificada: si estamos en profundidad > 0, usar barras
+             printf("│  ");
+        }
+
+        // Imprimir el conector (├─ o └─)
+        const char *connector = (i == children_count - 1) ? "└─ " : "├─ ";
+        printf("%s", connector);
+
+        // Imprimir el nodo actual
+        printf("[%-5d] %s\n", children_list[i].pid, children_list[i].comm);
+
+        // Llamada recursiva (solo si tiene hijos)
+        print_process_tree_recursive(children_list[i].pid, depth + 1, NULL, 0); 
+    }
+
+    free(children_list);
 }
 
 // Wrapper para la función principal (Parte 4)
-void print_process_tree(pid_t root_pid, int depth) {
-    char comm_buffer[256];
-    get_ppid(root_pid, comm_buffer, sizeof(comm_buffer)); // Obtener nombre
+void print_process_tree(pid_t root_pid) {
+    char comm_buffer[COMMAND_LEN];
+    get_ppid_comm(root_pid, comm_buffer, sizeof(comm_buffer)); // Obtener nombre
+    
+    // Imprimir el nodo raíz (procman mismo)
     printf("[%-5d] %s\n", root_pid, comm_buffer);
     
-    // Llamar a la función recursiva para encontrar los hijos de 'root_pid'
-    print_process_tree_recursive(root_pid, 0); 
+    // Iniciar la recursión (el root_pid es el padre de primer nivel)
+    print_process_tree_recursive(root_pid, 0, NULL, 0); 
 }
+
+// -----------------------------------------------------------------------------
+// Parte 5: Interactive Shell
+// -----------------------------------------------------------------------------
+
 // Auxiliar: Parsea la línea de comando.
-// Retorna el número de argumentos (incluyendo el comando).
 int parse_command(char *line, char *cmd_name, char *args[]) {
     char *token;
     int arg_count = 0;
@@ -475,9 +530,8 @@ int parse_command(char *line, char *cmd_name, char *args[]) {
     
     // Primer token (el comando)
     token = strtok(line, " ");
-    if (token == NULL) {
-        return 0; // Línea vacía
-    }
+    if (token == NULL) return 0; // Línea vacía
+    
     strncpy(cmd_name, token, COMMAND_LEN - 1);
     cmd_name[COMMAND_LEN - 1] = '\0';
     args[arg_count++] = cmd_name;
@@ -490,6 +544,7 @@ int parse_command(char *line, char *cmd_name, char *args[]) {
     
     return arg_count;
 }
+
 // Parte 5: Interactive Shell
 void run_interactive_shell(void) {
     char line[1024];
@@ -500,12 +555,8 @@ void run_interactive_shell(void) {
     memset(process_table, 0, sizeof(process_table));
     
     while (1) {
-        // Limpiar el estado de los procesos que hayan terminado
-        for (int i = 0; i < MAX_PROCESSES; i++) {
-            if (process_table[i].pid != 0 && process_table[i].status == 0) {
-                check_process_status(process_table[i].pid);
-            }
-        }
+        // 🚨 Zona de limpieza segura: Revisar si el handler SIGCHLD marcó que hay trabajo pendiente.
+        reap_terminated_children();
 
         printf("ProcMan> ");
         if (fgets(line, sizeof(line), stdin) == NULL) {
@@ -538,7 +589,6 @@ void run_interactive_shell(void) {
             printf("  quit                       - Exit program\n");
 
         } else if (strcmp(cmd_name, "create") == 0) {
-            // Argumentos: args[0]="create", args[1]=command, args[2...]=args
             if (args[1] != NULL) {
                 pid_t pid = create_process(args[1], &args[1]);
                 if (pid > 0) {
@@ -564,7 +614,7 @@ void run_interactive_shell(void) {
 
         } else if (strcmp(cmd_name, "tree") == 0) {
             printf("Process Tree:\n");
-            print_process_tree(getpid(), 0);
+            print_process_tree(getpid());
 
         } else if (strcmp(cmd_name, "wait") == 0) {
             wait_all_processes();
@@ -574,6 +624,7 @@ void run_interactive_shell(void) {
         }
     }
 }
+
 // main function
 int main() {
     setup_signal_handlers(); // Configurar manejo de señales
@@ -581,4 +632,3 @@ int main() {
 
     return 0;
 }
-
